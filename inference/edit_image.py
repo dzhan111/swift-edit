@@ -13,6 +13,7 @@ from models.swiftedit_models import (
 import torch
 import sys
 import os
+import argparse
 from pathlib import Path
 from PIL import Image
 from typing import Optional
@@ -97,15 +98,15 @@ class SwiftEditPipeline:
             source_image: Path to image or PIL Image
             source_prompt: Source description
             edit_prompt: Edit description
-            edit_mask: Optional pre-defined mask 
+            edit_mask: Optional pre-defined mask
             use_self_guided_mask: Extract mask automatically
-            scale_edit: Image condition scale in edit region 
-            scale_non_edit: Image condition scale in non-edit region 
-            scale_text: Text-alignment scale 
+            scale_edit: Image condition scale in edit region
+            scale_non_edit: Image condition scale in non-edit region
+            scale_text: Text-alignment scale
             return_intermediate: Return intermediate results (return will be a dict)
 
         Returns:
-            Edited PIL Image 
+            Edited PIL Image
         """
         if isinstance(source_image, str):
             source_image = Image.open(source_image).convert("RGB")
@@ -200,8 +201,6 @@ class SwiftEditPipeline:
             source_image: Original image
             edited_image: Edited image
             edit_mask: Editing mask
-            source_prompt: Source prompt
-            edit_prompt: Edit prompt
 
         Returns:
             Combined visualization image
@@ -216,8 +215,6 @@ class SwiftEditPipeline:
 
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="SwiftEdit")
     parser.add_argument("--source_image", type=str,
@@ -286,9 +283,7 @@ def main():
         visualization = pipeline.create_visualization(
             source_image=result["source_image"],
             edited_image=edited_image,
-            edit_mask=result["edit_mask"],
-            source_prompt=args.source_prompt,
-            edit_prompt=args.edit_prompt,
+            edit_mask=result["edit_mask"]
         )
         visualization.save(args.output.replace(".png", "_vis.png"))
         print(

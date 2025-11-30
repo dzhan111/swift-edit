@@ -29,7 +29,7 @@ def extract_editing_mask(
         image_latent: Source image latent z^source
         source_prompt: Source description
         edit_prompt: Edit description
-        threshold: Threshold for binary mask 
+        threshold: Threshold for binary mask
         clamp_rate: Clamping multiplier
         mid_timestep: Timestep for mask extraction
 
@@ -134,3 +134,23 @@ def create_side_by_side(
             x_offset += img.width
 
     return combined
+
+
+def preprocess_image_for_vae(
+    image: Image.Image,
+    size: tuple = (512, 512),
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Preprocess PIL image for VAE encoding.
+    Returns:
+        Preprocessed tensor, shape (1, 3, H, W), values in [-1, 1] range
+    """
+    transform = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])
+
+    pixel_values = transform(image).unsqueeze(0).to(device, dtype=torch.float32)
+    return pixel_values

@@ -14,6 +14,7 @@ from .image_projection import ImageProjectionModel
 from .attention_processors import StandardAttnProcessor, IPAdapterAttnProcessor
 from .mask_attention_processor import MaskAwareIPAttnProcessor
 from .mask_controller import MaskController
+from utils.editing_utils import preprocess_image_for_vae
 
 
 def tokenize_captions(tokenizer, captions: List[str]) -> torch.Tensor:
@@ -52,7 +53,7 @@ class AuxiliaryModels:
             base_model_name, subfolder="scheduler"
         )
 
-        self.vae = AutoencoderKL.from_pretrained(
+        self.vae_decoder = AutoencoderKL.from_pretrained(
             base_model_name, subfolder="vae"
         ).to(device, dtype=torch.float32)
 
@@ -91,8 +92,8 @@ class InversionModel:
 
     Args:
         pretrained_model_path: Path to pretrained inversion network
-        base_model_name: Base model for noise scheduler and VAE 
-        dtype: Weight dtype 
+        base_model_name: Base model for noise scheduler and VAE
+        dtype: Weight dtype
         device: Device to load on
     """
 
@@ -118,7 +119,7 @@ class InversionModel:
             base_model_name, subfolder="scheduler"
         )
 
-        self.vae = AutoencoderKL.from_pretrained(
+        self.vae_encoder = AutoencoderKL.from_pretrained(
             base_model_name, subfolder="vae"
         ).to(device, dtype=torch.float32)
 
@@ -156,19 +157,8 @@ class InversionModel:
         Returns:
             Latent representation, shape (1, 4, H/8, W/8)
         """
-        import torchvision.transforms as transforms
-        transform = transforms.Compose([
-            transforms.Resize((512, 512)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-
-        pixel_values = transform(image).unsqueeze(
-            0).to(self.device, dtype=torch.float32)
-
-        latent = self.vae.encode(pixel_values).latent_dist.sample()
-        latent = latent * self.vae.config.scaling_factor
-
+        pixel_values = preprocess_image_for_vae(image, device=self.device)
+        latent = self.vae_encoder.encode(pixel_values).latent_dist.sample() * self.vae_encoder.config.scaling_factor
         return latent
 
     @torch.no_grad()
@@ -416,15 +406,15 @@ class IPSBv2Model(nn.Module):
                 -clip_range, clip_range)
 
         pred_original_sample = pred_original_sample / \
-            self.aux_models.vae.config.scaling_factor
-        images = self.aux_models.vae.decode(
+            self.aux_models.vae_decoder.config.scaling_factor
+        images = self.aux_models.vae_decoder.decode(
             pred_original_sample.to(dtype=torch.float32)
         ).sample
 
         images = (images + 1.0) / 2.0
 
-        noise_vis = noise / self.aux_models.vae.config.scaling_factor
-        noise_images = self.aux_models.vae.decode(
+        noise_vis = noise / self.aux_models.vae_decoder.config.scaling_factor
+        noise_images = self.aux_models.vae_decoder.decode(
             noise_vis.to(dtype=torch.float32)
         ).sample
         noise_images = (noise_images + 1.0) / 2.0
