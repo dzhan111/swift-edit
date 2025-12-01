@@ -1,5 +1,6 @@
 from utils.editing_utils import (
     extract_editing_mask,
+    extract_attention_based_mask,
     postprocess_image,
     visualize_mask,
     create_side_by_side,
@@ -78,6 +79,7 @@ class SwiftEditPipeline:
         edit_prompt: str,
         edit_mask: Optional[torch.Tensor] = None,
         use_self_guided_mask: bool = True,
+        mask_method: str = "noise",
         scale_edit: float = 0.2,
         scale_non_edit: float = 1.0,
         scale_text: float = 1.0,
@@ -100,6 +102,7 @@ class SwiftEditPipeline:
             edit_prompt: Edit description
             edit_mask: Optional pre-defined mask
             use_self_guided_mask: Extract mask automatically
+            mask_method: Mask extraction method - "noise" (default) or "attention"
             scale_edit: Image condition scale in edit region
             scale_non_edit: Image condition scale in non-edit region
             scale_text: Text-alignment scale
@@ -126,32 +129,45 @@ class SwiftEditPipeline:
         inverted_noise = self.inversion_model.invert(
             image_latent, source_prompt)
 
+        # Construct noisy latent (needed for both mask extraction and generation)
+        noisy_latent = (
+            self.ip_sbv2_model.alpha_t * image_latent +
+            self.ip_sbv2_model.sigma_t * inverted_noise
+        )
+
         # Extract editing mask
         print("Step 3/5: Extracting editing mask...")
         if edit_mask is None and use_self_guided_mask:
-            edit_mask = extract_editing_mask(
-                inversion_model=self.inversion_model,
-                image_latent=image_latent,
-                source_prompt=source_prompt,
-                edit_prompt=edit_prompt,
-                threshold=0.5,
-                clamp_rate=3.0,
-                mid_timestep=500,
-            )
+            if mask_method == "attention":
+                edit_mask = extract_attention_based_mask(
+                    ip_sbv2_model=self.ip_sbv2_model,
+                    noisy_latent=noisy_latent,
+                    source_prompt=source_prompt,
+                    edit_prompt=edit_prompt,
+                    source_image=source_image,
+                    threshold=0.5,
+                    clamp_rate=3.0,
+                )
+            else:  # mask_method == "noise" (default)
+                edit_mask = extract_editing_mask(
+                    inversion_model=self.inversion_model,
+                    image_latent=image_latent,
+                    source_prompt=source_prompt,
+                    edit_prompt=edit_prompt,
+                    threshold=0.5,
+                    clamp_rate=3.0,
+                    mid_timestep=500,
+                )
             print(
-                f"  Mask extracted (coverage: {(edit_mask > 0.5).float().mean().item():.2%})")
+                f"  Mask extracted (method: {mask_method}, coverage: {(edit_mask > 0.5).float().mean().item():.2%})")
         elif edit_mask is None:
             edit_mask = torch.ones(
                 1, 1, image_latent.shape[2], image_latent.shape[3],
                 device=self.device
             )
 
-        # Construct noisy latent
+        # Construct noisy latent (already done above, but keeping for clarity)
         print("Step 4/5: Constructing noisy latent...")
-        noisy_latent = (
-            self.ip_sbv2_model.alpha_t * image_latent +
-            self.ip_sbv2_model.sigma_t * inverted_noise
-        )
 
         # Setup mask controller for ARaM
         print("Step 5/5: Setting up ARaM and generating...")
@@ -214,86 +230,90 @@ class SwiftEditPipeline:
         return comparison
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="SwiftEdit")
-    parser.add_argument("--source_image", type=str,
-                        required=True, help="Path to source image")
-    parser.add_argument("--source_prompt", type=str,
-                        required=True, help="Source description")
-    parser.add_argument("--edit_prompt", type=str,
-                        required=True, help="Edit description")
-    parser.add_argument("--output", type=str,
-                        default="edited.png", help="Output path")
-    parser.add_argument("--weights_root", type=str, default="swiftedit_weights",
-                        help="Root directory for SwiftEdit weights")
-    parser.add_argument("--inversion_model", type=str, default=None,
-                        help="Inversion model path (default: weights_root/inverse_ckpt-120k)")
-    parser.add_argument("--sbv2_model", type=str, default=None,
-                        help="SwiftBrushV2 model path (default: weights_root/sbv2_0.5)")
-    parser.add_argument("--ip_adapter", type=str, default=None,
-                        help="IP-Adapter path (default: weights_root/ip_adapter_ckpt-90k/ip_adapter.bin)")
-    parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--inversion_base_model", type=str, default="stabilityai/sd-turbo",
-                        help="Base model for inversion (default: SD-Turbo)")
-    parser.add_argument("--no_mask", action="store_true",
-                        help="Disable self-guided mask")
-    parser.add_argument("--scale_edit", type=float, default=0.2,
-                        help="s_edit (default: 0.2)")
-    parser.add_argument("--scale_non_edit", type=float,
-                        default=1.0, help="s_non-edit (default: 1.0)")
-    parser.add_argument("--scale_text", type=float, default=1.0,
-                        help="s_y/scale_ta (default: 1.0)")
-    parser.add_argument("--visualize", action="store_true",
-                        help="Create visualization")
+# def main():
+#     parser = argparse.ArgumentParser(
+#         description="SwiftEdit")
+#     parser.add_argument("--source_image", type=str,
+#                         required=True, help="Path to source image")
+#     parser.add_argument("--source_prompt", type=str,
+#                         required=True, help="Source description")
+#     parser.add_argument("--edit_prompt", type=str,
+#                         required=True, help="Edit description")
+#     parser.add_argument("--output", type=str,
+#                         default="edited.png", help="Output path")
+#     parser.add_argument("--weights_root", type=str, default="swiftedit_weights",
+#                         help="Root directory for SwiftEdit weights")
+#     parser.add_argument("--inversion_model", type=str, default=None,
+#                         help="Inversion model path (default: weights_root/inverse_ckpt-120k)")
+#     parser.add_argument("--sbv2_model", type=str, default=None,
+#                         help="SwiftBrushV2 model path (default: weights_root/sbv2_0.5)")
+#     parser.add_argument("--ip_adapter", type=str, default=None,
+#                         help="IP-Adapter path (default: weights_root/ip_adapter_ckpt-90k/ip_adapter.bin)")
+#     parser.add_argument("--device", type=str, default="cuda", help="Device")
+#     parser.add_argument("--inversion_base_model", type=str, default="stabilityai/sd-turbo",
+#                         help="Base model for inversion (default: SD-Turbo)")
+#     parser.add_argument("--no_mask", action="store_true",
+#                         help="Disable self-guided mask")
+#     parser.add_argument("--mask_method", type=str, default="noise",
+#                         choices=["noise", "attention"],
+#                         help="Mask extraction method: 'noise' (default) or 'attention'")
+#     parser.add_argument("--scale_edit", type=float, default=0.2,
+#                         help="s_edit (default: 0.2)")
+#     parser.add_argument("--scale_non_edit", type=float,
+#                         default=1.0, help="s_non-edit (default: 1.0)")
+#     parser.add_argument("--scale_text", type=float, default=1.0,
+#                         help="s_y/scale_ta (default: 1.0)")
+#     parser.add_argument("--visualize", action="store_true",
+#                         help="Create visualization")
 
-    args = parser.parse_args()
+#     args = parser.parse_args()
 
-    if args.inversion_model is None:
-        args.inversion_model = os.path.join(
-            args.weights_root, "inverse_ckpt-120k")
-    if args.sbv2_model is None:
-        args.sbv2_model = os.path.join(args.weights_root, "sbv2_0.5")
-    if args.ip_adapter is None:
-        args.ip_adapter = os.path.join(
-            args.weights_root, "ip_adapter_ckpt-90k/ip_adapter.bin")
+#     if args.inversion_model is None:
+#         args.inversion_model = os.path.join(
+#             args.weights_root, "inverse_ckpt-120k")
+#     if args.sbv2_model is None:
+#         args.sbv2_model = os.path.join(args.weights_root, "sbv2_0.5")
+#     if args.ip_adapter is None:
+#         args.ip_adapter = os.path.join(
+#             args.weights_root, "ip_adapter_ckpt-90k/ip_adapter.bin")
 
-    pipeline = SwiftEditPipeline(
-        inversion_model_path=args.inversion_model,
-        sbv2_model_path=args.sbv2_model,
-        ip_adapter_path=args.ip_adapter,
-        base_model_name="sd2-community/stable-diffusion-2-1-base",
-        inversion_base_model=args.inversion_base_model,
-        device=args.device,
-    )
+#     pipeline = SwiftEditPipeline(
+#         inversion_model_path=args.inversion_model,
+#         sbv2_model_path=args.sbv2_model,
+#         ip_adapter_path=args.ip_adapter,
+#         base_model_name="sd2-community/stable-diffusion-2-1-base",
+#         inversion_base_model=args.inversion_base_model,
+#         device=args.device,
+#     )
 
-    result = pipeline.edit(
-        source_image=args.source_image,
-        source_prompt=args.source_prompt,
-        edit_prompt=args.edit_prompt,
-        use_self_guided_mask=not args.no_mask,
-        scale_edit=args.scale_edit,
-        scale_non_edit=args.scale_non_edit,
-        scale_text=args.scale_text,
-        return_intermediate=args.visualize,
-    )
+#     result = pipeline.edit(
+#         source_image=args.source_image,
+#         source_prompt=args.source_prompt,
+#         edit_prompt=args.edit_prompt,
+#         use_self_guided_mask=not args.no_mask,
+#         mask_method=args.mask_method,
+#         scale_edit=args.scale_edit,
+#         scale_non_edit=args.scale_non_edit,
+#         scale_text=args.scale_text,
+#         return_intermediate=args.visualize,
+#     )
 
-    if args.visualize:
-        edited_image = result["edited_image"]
-        visualization = pipeline.create_visualization(
-            source_image=result["source_image"],
-            edited_image=edited_image,
-            edit_mask=result["edit_mask"]
-        )
-        visualization.save(args.output.replace(".png", "_vis.png"))
-        print(
-            f"Visualization saved to {args.output.replace('.png', '_vis.png')}")
-    else:
-        edited_image = result
+#     if args.visualize:
+#         edited_image = result["edited_image"]
+#         visualization = pipeline.create_visualization(
+#             source_image=result["source_image"],
+#             edited_image=edited_image,
+#             edit_mask=result["edit_mask"]
+#         )
+#         visualization.save(args.output.replace(".png", "_vis.png"))
+#         print(
+#             f"Visualization saved to {args.output.replace('.png', '_vis.png')}")
+#     else:
+#         edited_image = result
 
-    edited_image.save(args.output)
-    print(f"Edited image saved to {args.output}")
+#     edited_image.save(args.output)
+#     print(f"Edited image saved to {args.output}")
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

@@ -46,6 +46,13 @@ def parse_args():
         choices=["fp32", "fp16", "bf16"],
         help="Weight dtype (default: fp32)",
     )
+    parser.add_argument(
+        "--mask_method",
+        type=str,
+        default="noise",
+        choices=["noise", "attention"],
+        help="Mask extraction method: 'noise' (default) or 'attention'",
+    )
 
     return parser.parse_args()
 
@@ -62,7 +69,7 @@ def main():
 
     if args.output_image_path is None:
         source_path = Path(args.source_image_path)
-        output_path = source_path.parent / f"{source_path.stem}_edited{source_path.suffix}"
+        output_path = source_path.parent / f"{source_path.stem}_edited_{args.mask_method}{source_path.suffix}"
     else:
         output_path = Path(args.output_image_path)
 
@@ -79,6 +86,7 @@ def main():
         source_image=args.source_image_path,
         source_prompt=args.source_prompt,
         edit_prompt=args.edit_prompt,
+        mask_method=args.mask_method,
     )
 
     edited_image.save(str(output_path))
