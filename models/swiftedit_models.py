@@ -189,6 +189,54 @@ class InversionModel:
         return inverted_noise
 
 
+class AttentionCapturingWrapper:
+    def __init__(self, original_processor, layer_name):
+        self.original_processor = original_processor
+        self.layer_name = layer_name
+        self.attention_map = None
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, **kwargs):
+        # Skip self-attention
+        if encoder_hidden_states is None:
+            return self.original_processor(attn, hidden_states, encoder_hidden_states, **kwargs)
+
+        # Flatten 4D inputs to 2D
+        if hidden_states.ndim == 4:
+            batch_size, c, h, w = hidden_states.shape
+            hidden_states_flat = hidden_states.view(batch_size, c, h * w).transpose(1, 2)
+        else:
+            batch_size = hidden_states.shape[0]
+            hidden_states_flat = hidden_states
+
+        # Extract text tokens
+        num_tokens = getattr(self.original_processor, 'num_tokens', 0)
+        if num_tokens > 0 and encoder_hidden_states.shape[1] > num_tokens:
+            text_hidden_states = encoder_hidden_states[:, :-num_tokens, :]
+        else:
+            text_hidden_states = encoder_hidden_states
+
+        # Normalize
+        if attn.norm_cross:
+            text_hidden_states = attn.norm_encoder_hidden_states(text_hidden_states)
+
+        # Compute and store attention map
+        try:
+            query = attn.to_q(hidden_states_flat)  # (B, N, D)
+            key = attn.to_k(text_hidden_states)    # (B, M, D)
+
+            # Reshape for multi-head: (B, N, D) -> (B, H, N, D_h)
+            head_dim = query.shape[-1] // attn.heads
+            query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+            # Compute Q @ K^T (before softmax)
+            self.attention_map = (torch.einsum('b h i d, b h j d -> b h i j', query, key) * attn.scale).detach()
+        except Exception as e:
+            pass
+
+        return self.original_processor(attn, hidden_states, encoder_hidden_states, **kwargs)
+
+
 class IPSBv2Model(nn.Module):
     """
     SwiftBrushv2 model with IP-Adapter (G^IP)
@@ -337,6 +385,68 @@ class IPSBv2Model(nn.Module):
                 should_set = any(block_name in name for block_name in where)
                 if should_set:
                     attn_processor.controller = controller
+
+    @torch.no_grad()
+    def collect_attention_maps(
+        self,
+        noisy_latent: torch.Tensor,
+        prompt: str,
+        source_image: Optional[Image.Image] = None,
+        scale: float = 1.0,
+    ) -> List[torch.Tensor]:
+        """
+        Collect cross-attention maps from UNet forward pass.
+
+        Args:
+            noisy_latent: Noisy latent tensor, shape (1, 4, H/8, W/8)
+            prompt: Text prompt for attention computation
+            source_image: Optional source image for IP-Adapter
+            scale: Image condition scale
+
+        Returns:
+            List of attention maps, one per cross-attention layer (mid_block, up_blocks)
+            Each map shape: (batch=1, heads, spatial_tokens, text_tokens)
+        """
+        self.set_scale(scale)
+
+        # Prepare prompt embeddings
+        text_embeds = self.aux_models.encode_text([prompt])
+        if source_image is not None:
+            image_embeds = self.get_image_embeds(pil_images=[source_image])
+            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
+        else:
+            prompt_embeds = text_embeds
+
+        # Wrap cross-attention processors in mid_block and up_blocks
+        original_processors = {}
+        wrapped_processors = {}
+
+        for name, processor in self.unet.attn_processors.items():
+            original_processors[name] = processor
+
+            # Wrap only cross-attention (attn2) in mid_block/up_blocks
+            should_wrap = (
+                (name.startswith("mid_block") or name.startswith("up_blocks"))
+                and "attn2" in name
+            )
+            wrapped_processors[name] = (
+                AttentionCapturingWrapper(processor, name) if should_wrap
+                else processor
+            )
+
+        # Run forward pass with wrapped processors
+        self.unet.set_attn_processor(wrapped_processors)
+        _ = self.unet(noisy_latent, self.timestep, prompt_embeds).sample
+
+        # Collect attention maps from wrappers
+        attention_maps = [
+            proc.attention_map
+            for proc in self.unet.attn_processors.values()
+            if isinstance(proc, AttentionCapturingWrapper) and proc.attention_map is not None
+        ]
+
+        self.unet.set_attn_processor(original_processors)
+        return attention_maps
 
     @torch.no_grad()
     def generate(
