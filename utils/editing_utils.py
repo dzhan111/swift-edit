@@ -86,103 +86,64 @@ def extract_attention_based_mask(
         threshold: Threshold for binary mask
         clamp_rate: Clamping multiplier for normalization
 
-    Returns:
-        Editing mask, shape (1, 1, H, W)
     """
-    def to_binary(pix, thresh=threshold):
-        return 1.0 if float(pix) > thresh else 0.0
-
     attn_maps_source = ip_sbv2_model.collect_attention_maps(
-        noisy_latent=noisy_latent,
-        prompt=source_prompt,
-        source_image=source_image,
-        scale=1.0,
+        noisy_latent=noisy_latent, prompt=source_prompt,
+        source_image=source_image, scale=1.0
     )
-
     attn_maps_edit = ip_sbv2_model.collect_attention_maps(
-        noisy_latent=noisy_latent,
-        prompt=edit_prompt,
-        source_image=source_image,
-        scale=1.0,
+        noisy_latent=noisy_latent, prompt=edit_prompt,
+        source_image=source_image, scale=1.0
     )
 
     if len(attn_maps_source) != len(attn_maps_edit):
-        raise ValueError(f"Mismatch in number of attention layers: {len(attn_maps_source)} vs {len(attn_maps_edit)}")
+        raise ValueError(f"Mismatch: {len(attn_maps_source)} vs {len(attn_maps_edit)} layers")
 
-    # Compute attention difference per layer
-    attn_diffs = []
+    # Helper to reshape 1D to 2D spatial
+    def to_spatial(tensor_1d):
+        n = tensor_1d.shape[0]
+        h = int(np.sqrt(n))
+        w = (n + h - 1) // h
+        return tensor_1d.view(h, w)
+
+    # Compute differences and aggregate per layer
+    attn_spatials = []
     for attn_src, attn_edit in zip(attn_maps_source, attn_maps_edit):
-        attn_diff = torch.abs(attn_src - attn_edit)  # (1, H, N, M)
-        attn_diff = attn_diff.mean(dim=1)  # (1, N, M)
-        attn_diff = attn_diff.mean(dim=-1)  # (1, N)
-        attn_diffs.append(attn_diff.squeeze(0))  # (N,)
+        diff = (attn_src - attn_edit).abs().mean(dim=[1, -1]).squeeze(0)  # (N,)
+        attn_spatials.append(to_spatial(diff))
 
-    # Aggregate over layers with weighted mean
-    num_layers = len(attn_diffs)
+    # Compute layer weights (later layers get more weight)
+    num_layers = len(attn_spatials)
     if num_layers == 0:
         raise ValueError("No attention maps collected")
 
-    if num_layers == 1:
-        weights = [1.0]
-    elif num_layers == 2:
-        weights = [0.3, 0.7]
-    elif num_layers == 3:
-        weights = [0.2, 0.3, 0.5]
+    if num_layers <= 3:
+        weights = [[1.0], [0.3, 0.7], [0.2, 0.3, 0.5]][num_layers - 1]
     else:
-        weights = torch.linspace(0.1, 0.9, num_layers).tolist()
-        weights = [w / sum(weights) for w in weights]  # Normalize
+        weights = torch.linspace(0.1, 0.9, num_layers)
+        weights = (weights / weights.sum()).tolist()
 
-    # Reshape each attention diff to spatial dimensions (H, W)
-    # Each attn_diff has shape (N,) where N = H * W
-    attn_spatials = []
-    for attn_diff in attn_diffs:
-        num_spatial = attn_diff.shape[0]
-        # Find H, W such that H * W = num_spatial
-        H = W = int(np.sqrt(num_spatial))
-        if H * W != num_spatial:
-            # If not perfect square, find closest factors
-            H = int(np.sqrt(num_spatial))
-            W = (num_spatial + H - 1) // H  # Ceiling division
-        attn_spatial = attn_diff.view(H, W)
-        attn_spatials.append(attn_spatial)
+    # Interpolate all to common size and aggregate
+    target_size = tuple(max(sp.shape[i] for sp in attn_spatials) for i in range(2))
+    aggregated = sum(
+        weight * F.interpolate(
+            sp.unsqueeze(0).unsqueeze(0), size=target_size,
+            mode='bilinear', align_corners=False
+        ).squeeze()
+        for sp, weight in zip(attn_spatials, weights)
+    )
 
-    # Interpolate all to a common size (use the largest spatial dimension)
-    max_h = max(sp.shape[0] for sp in attn_spatials)
-    max_w = max(sp.shape[1] for sp in attn_spatials)
+    # Normalize: clamp to [0, mean * clamp_rate] then scale to [0, 1]
+    max_val = aggregated.mean() * clamp_rate
+    mask = (aggregated.clamp(0, max_val) / max_val) if max_val > 0 else torch.zeros_like(aggregated)
 
-    aggregated_attn = None
-    for i, (attn_spatial, weight) in enumerate(zip(attn_spatials, weights)):
-        # Interpolate to common size
-        if attn_spatial.shape != (max_h, max_w):
-            attn_spatial = F.interpolate(
-                attn_spatial.unsqueeze(0).unsqueeze(0),  # (1, 1, H, W)
-                size=(max_h, max_w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze()  # (H, W)
-
-        if aggregated_attn is None:
-            aggregated_attn = weight * attn_spatial
-        else:
-            aggregated_attn += weight * attn_spatial
-
-    mask = aggregated_attn
-    max_v = (mask.mean() * clamp_rate).item()
-    if max_v > 0:
-        mask = mask.clamp(0, max_v) / max_v
-    else:
-        mask = torch.zeros_like(mask)
-
-    mask = mask.detach().cpu().apply_(lambda pix: to_binary(pix, threshold))
-    mask = mask.to(noisy_latent.device)
+    # Binarize and resize to latent dimensions
+    mask = (mask > threshold).float()
     _, _, latent_h, latent_w = noisy_latent.shape
-
-    mask = mask.unsqueeze(0).unsqueeze(0)
     mask = F.interpolate(
-        mask,
+        mask.unsqueeze(0).unsqueeze(0),
         size=(latent_h, latent_w),
-        mode='bilinear',
-        align_corners=False
+        mode='bilinear', align_corners=False
     )
 
     return mask

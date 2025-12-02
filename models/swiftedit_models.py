@@ -196,64 +196,44 @@ class AttentionCapturingWrapper:
         self.attention_map = None
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, **kwargs):
-        # Only capture attention for cross-attention layers (encoder_hidden_states must be provided)
+        # Skip self-attention
         if encoder_hidden_states is None:
-            # This is self-attention, skip capturing
             return self.original_processor(attn, hidden_states, encoder_hidden_states, **kwargs)
 
-        # Handle 4D inputs (same as original processor)
-        input_ndim = hidden_states.ndim
-        if input_ndim == 4:
-            batch_size, channel, height, width = hidden_states.shape
-            hidden_states_flat = hidden_states.view(
-                batch_size, channel, height * width).transpose(1, 2)
+        # Flatten 4D inputs to 2D
+        if hidden_states.ndim == 4:
+            batch_size, c, h, w = hidden_states.shape
+            hidden_states_flat = hidden_states.view(batch_size, c, h * w).transpose(1, 2)
         else:
-            batch_size, _, _ = hidden_states.shape
+            batch_size = hidden_states.shape[0]
             hidden_states_flat = hidden_states
 
-        # Extract text embeddings (exclude image tokens if present)
-        # For IP-Adapter, last 4 tokens are image features
-        if hasattr(self.original_processor, 'num_tokens'):
-            num_tokens = self.original_processor.num_tokens
-            if encoder_hidden_states.shape[1] > num_tokens:
-                end_pos = encoder_hidden_states.shape[1] - num_tokens
-                text_hidden_states = encoder_hidden_states[:, :end_pos, :]
-            else:
-                text_hidden_states = encoder_hidden_states
+        # Extract text tokens
+        num_tokens = getattr(self.original_processor, 'num_tokens', 0)
+        if num_tokens > 0 and encoder_hidden_states.shape[1] > num_tokens:
+            text_hidden_states = encoder_hidden_states[:, :-num_tokens, :]
         else:
             text_hidden_states = encoder_hidden_states
 
-        # Apply normalization if needed (before computing Q, K)
+        # Normalize
         if attn.norm_cross:
             text_hidden_states = attn.norm_encoder_hidden_states(text_hidden_states)
 
-        # Debug: verify we have text_hidden_states
-        if text_hidden_states is None:
-            print(f"Warning: text_hidden_states is None for {self.layer_name}")
-            return self.original_processor(attn, hidden_states, encoder_hidden_states, **kwargs)
-
+        # Compute and store attention map
         try:
-            # Get query and key for text cross-attention
-            query = attn.to_q(hidden_states_flat)
-            key = attn.to_k(text_hidden_states)
+            query = attn.to_q(hidden_states_flat)  # (B, N, D)
+            key = attn.to_k(text_hidden_states)    # (B, M, D)
 
-            # Reshape for multi-head attention
+            # Reshape for multi-head: (B, N, D) -> (B, H, N, D_h)
             head_dim = query.shape[-1] // attn.heads
-            query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)  # (B, H, N, D)
-            key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)  # (B, H, M, D)
+            query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
 
-            # Compute attention similarity: Q @ K^T
-            # Shape: (B, H, N, M) where N=spatial_tokens, M=text_tokens
-            attention_sim = torch.einsum('b h i d, b h j d -> b h i j', query, key) * attn.scale
-
-            # Store attention map (before softmax)
-            self.attention_map = attention_sim.detach()
+            # Compute Q @ K^T (before softmax)
+            self.attention_map = (torch.einsum('b h i d, b h j d -> b h i j', query, key) * attn.scale).detach()
         except Exception as e:
-            print(f"Error in wrapper {self.layer_name}: {e}")
-            import traceback
-            traceback.print_exc()
+            pass
 
-        # Continue with original processor
         return self.original_processor(attn, hidden_states, encoder_hidden_states, **kwargs)
 
 
@@ -431,47 +411,39 @@ class IPSBv2Model(nn.Module):
 
         # Prepare prompt embeddings
         text_embeds = self.aux_models.encode_text([prompt])
-
         if source_image is not None:
-            image_prompt_embeds = self.get_image_embeds(pil_images=[source_image])
-            prompt_embeds = torch.cat([text_embeds, image_prompt_embeds], dim=1)
+            image_embeds = self.get_image_embeds(pil_images=[source_image])
+            prompt_embeds = torch.cat([text_embeds, image_embeds], dim=1)
         else:
             prompt_embeds = text_embeds
 
-        # Storage for attention maps
-        attention_maps = []
-
-        # Replace processors with wrappers for mid_block and up_blocks only
+        # Wrap cross-attention processors in mid_block and up_blocks
         original_processors = {}
         wrapped_processors = {}
-        wrapped_count = 0
-
 
         for name, processor in self.unet.attn_processors.items():
-            # Store original processor
             original_processors[name] = processor
 
-            # Only wrap cross-attention layers in mid_block and up_blocks
-            # (skip self-attention and down_blocks)
-            # Cross-attention layers have "attn2" in the name, self-attention has "attn1"
-            if (name.startswith("mid_block") or name.startswith("up_blocks")) and "attn2" in name:
-                wrapped_processors[name] = AttentionCapturingWrapper(processor, name)
-                wrapped_count += 1
-            else:
-                # Keep original processor for self-attention and down_blocks
-                wrapped_processors[name] = processor
+            # Wrap only cross-attention (attn2) in mid_block/up_blocks
+            should_wrap = (
+                (name.startswith("mid_block") or name.startswith("up_blocks"))
+                and "attn2" in name
+            )
+            wrapped_processors[name] = (
+                AttentionCapturingWrapper(processor, name) if should_wrap
+                else processor
+            )
 
-
-        # Set wrapped processors
+        # Run forward pass with wrapped processors
         self.unet.set_attn_processor(wrapped_processors)
-
-        # Run forward pass
         _ = self.unet(noisy_latent, self.timestep, prompt_embeds).sample
 
-        # Collect attention maps from the UNet's processors
-        for name, processor in self.unet.attn_processors.items():
-            if isinstance(processor, AttentionCapturingWrapper) and processor.attention_map is not None:
-                attention_maps.append(processor.attention_map)
+        # Collect attention maps from wrappers
+        attention_maps = [
+            proc.attention_map
+            for proc in self.unet.attn_processors.values()
+            if isinstance(proc, AttentionCapturingWrapper) and proc.attention_map is not None
+        ]
 
         self.unet.set_attn_processor(original_processors)
         return attention_maps

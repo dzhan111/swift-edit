@@ -90,6 +90,7 @@ def main():
     )
 
     edited_image.save(str(output_path))
+    print("Edited image saved to", output_path)
 
 if __name__ == "__main__":
     main()
