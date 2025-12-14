@@ -1,0 +1,6 @@
+python test_edit.py \
+    --source_image_path test_images/woman_face.jpg \
+    --source_prompt "a woman" \
+    --edit_prompt "a cat" \
+    --device cuda \
+    --mask_method attention
