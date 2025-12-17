@@ -1,0 +1,4 @@
+*.tar.*
+swiftedit_weights/*
+outputs/*
+debug_masks/*
