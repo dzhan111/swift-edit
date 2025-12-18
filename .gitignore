@@ -2,3 +2,8 @@
 swiftedit_weights/*
 outputs/*
 debug_masks/*
+*.pdf
+*.txt
+*.md
+*.sh 
+*.json
